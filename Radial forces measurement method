@@ -1,0 +1,276 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.signal import savgol_filter
+
+# ============= 1) 定义自定义平滑 & FWHM 函数 =============
+def peak_centered_smooth_custom(counts):
+    """
+    单次“以峰为中心”修正。
+    若在向外(离峰更远)的连续bin都比当前基准bin更大，
+    则把它们和当前bin一起取平均后赋值回去。
+    """
+    smoothed = counts.astype(float).copy()
+    n = len(smoothed)
+    peak_idx = np.argmax(smoothed)
+
+    # 向左扫描
+    i = peak_idx
+    while i > 0:
+        base_val = smoothed[i]
+        if smoothed[i - 1] > base_val:
+            group = [i]
+            j = i - 1
+            while j >= 0 and smoothed[j] > base_val:
+                group.append(j)
+                j -= 1
+            avg_val = np.mean([smoothed[k] for k in group])
+            for k in group:
+                smoothed[k] = avg_val
+            i = j
+        else:
+            i -= 1
+
+    # 向右扫描
+    i = peak_idx
+    while i < n - 1:
+        base_val = smoothed[i]
+        if smoothed[i + 1] > base_val:
+            group = [i]
+            j = i + 1
+            while j < n and smoothed[j] > base_val:
+                group.append(j)
+                j += 1
+            avg_val = np.mean([smoothed[k] for k in group])
+            for k in group:
+                smoothed[k] = avg_val
+            i = j
+        else:
+            i += 1
+
+    return smoothed
+
+def get_peak_and_fwhm_custom(counts, bins, n_iter=2):
+    """
+    对 counts 做 n_iter 次 'peak_centered_smooth_custom'，
+    然后用最高计数 + 半高搜索得到峰值 (bin 中心) 和 FWHM。
+    返回 (peak_bin_center, fwhm, smoothed_counts)
+    """
+    smoothed_counts = counts.astype(float).copy()
+    for _ in range(n_iter):
+        smoothed_counts = peak_centered_smooth_custom(smoothed_counts)
+    
+    # 找峰
+    peak_idx = np.argmax(smoothed_counts)
+    peak_val = smoothed_counts[peak_idx]
+    # 如果峰落在最后一个 bin 的边界附近，需要保证不会越界
+    if peak_idx == len(bins) - 1:
+        peak_idx = len(bins) - 2
+    peak_bin_center = 0.5 * (bins[peak_idx] + bins[peak_idx + 1])
+
+    # 半高
+    half_val = peak_val / 2
+
+    # 向左找
+    left_idx = peak_idx
+    while left_idx > 0:
+        if smoothed_counts[left_idx] < half_val:
+            break
+        left_idx -= 1
+
+    # 向右找
+    right_idx = peak_idx
+    while right_idx < len(smoothed_counts) - 1:
+        if smoothed_counts[right_idx] < half_val:
+            break
+        right_idx += 1
+
+    # 防止越界
+    if right_idx == len(bins) - 1:
+        right_idx = len(bins) - 2
+
+    left_bin_center = 0.5 * (bins[left_idx] + bins[left_idx + 1])
+    right_bin_center = 0.5 * (bins[right_idx] + bins[right_idx + 1])
+    fwhm = right_bin_center - left_bin_center
+
+    return peak_bin_center, fwhm, smoothed_counts
+
+# ============= 2) 以下是完整数据处理与绘图流程 =============
+
+# ---------------- 实验参数 ----------------
+magnification = 100        # 物镜放大倍数
+pixel_size = 3.45e-6       # 相机像素尺寸 (m)
+fps = 34                   # 采集帧率 (Hz)
+calibration = pixel_size / magnification  # (m/像素)
+
+# 读取 CSV 数据
+file_path = "F POWER is 0.70_circle_data.csv"
+data = pd.read_csv(file_path)
+
+# 检查列名
+print("CSV 列名:", data.columns)
+
+# 确认存在 'X','Y' 两列
+if not {'X','Y'}.issubset(data.columns):
+    raise ValueError("CSV 文件中未找到列 'X' 或 'Y'，请根据实际数据列名修改代码。")
+
+# 计算时间轴
+data['Time'] = data.index / fps
+
+# 计算帧间位移
+data['ΔX'] = data['X'].diff()
+data['ΔY'] = data['Y'].diff()
+
+# 计算瞬时速度 (像素/帧 → m/s)
+data['Vr'] = np.sqrt((data['ΔX'] * fps)**2 + (data['ΔY'] * fps)**2) * calibration
+
+# ---------------- 速度滤波 ----------------
+# 1. 滑动平均滤波
+window_size = 10  
+data['Vr_Smooth'] = data['Vr'].rolling(window=window_size, center=True).mean()
+
+# 2. Savitzky-Golay 滤波
+poly_order = 3
+window_size_sg = 15
+data['Vr_SG'] = savgol_filter(data['Vr'], window_size_sg, poly_order, mode='nearest')
+
+# ---------------- 计算粘滞力 (Viscous Force) ----------------
+viscosity = 1e-3  # 水的粘度 (Pa·s)
+radius = 2e-6     # 4 μm直径的球半径 (m)
+data['F_Viscous_Raw']    = 6 * np.pi * viscosity * radius * data['Vr']
+data['F_Viscous_Smooth'] = 6 * np.pi * viscosity * radius * data['Vr_Smooth']
+data['F_Viscous_SG']     = 6 * np.pi * viscosity * radius * data['Vr_SG']
+
+# ---------------- 速度曲线绘图 (1) Raw Data ----------------
+plt.figure(figsize=(10, 6))
+plt.plot(data['Time'], data['Vr'], alpha=0.6, color='C0', label='Raw Vr')
+plt.title("Instantaneous Speed (Vr) - Raw Data")
+plt.xlabel("Time (s)")
+plt.ylabel("Speed (m/s)")
+plt.legend()
+
+plt.savefig("Vr_Raw.png", dpi=300)  # 保存图像
+plt.show()
+
+# ---------------- 速度曲线绘图 (2) Rolling Average ----------------
+plt.figure(figsize=(10, 6))
+plt.plot(data['Time'], data['Vr_Smooth'], color='C1', label='Rolling Avg', linestyle='--')
+plt.title("Instantaneous Speed (Vr) - Rolling Average")
+plt.xlabel("Time (s)")
+plt.ylabel("Speed (m/s)")
+plt.legend()
+
+plt.savefig("Vr_RollingAvg.png", dpi=300)  # 保存图像
+plt.show()
+
+# ---------------- 速度曲线绘图 (3) Savitzky-Golay ----------------
+plt.figure(figsize=(10, 6))
+plt.plot(data['Time'], data['Vr_SG'], color='C2', label='Savitzky-Golay', linestyle=':')
+plt.title("Instantaneous Speed (Vr) - Savitzky-Golay Filter")
+plt.xlabel("Time (s)")
+plt.ylabel("Speed (m/s)")
+plt.legend()
+
+plt.savefig("Vr_SavitzkyGolay.png", dpi=300)  # 保存图像
+plt.show()
+
+# ---------------- 速度直方图 (4) 三种速度比较 ----------------
+speed_range = (0.5e-5, 1.5e-5)  # 设定速度范围 (m/s)
+bin_count = 50                  # 设定 bin 数量
+
+plt.figure(figsize=(12, 6))
+
+# (a) 原始 Vr 直方图
+plt.subplot(1, 3, 1)
+plt.hist(data['Vr'], bins=bin_count, range=speed_range, alpha=0.7, color='C0', label='Raw Vr')
+plt.title("Histogram of Instantaneous Speed (Vr)")
+plt.xlabel("Speed (m/s)")
+plt.ylabel("Frequency")
+plt.legend()
+
+# (b) Rolling Avg 直方图
+plt.subplot(1, 3, 2)
+counts_roll, bins_roll = np.histogram(data['Vr_Smooth'], bins=bin_count, range=speed_range)
+plt.hist(bins_roll[:-1], bins=bins_roll, weights=counts_roll, alpha=0.7, color='C1', label='Rolling Avg')
+plt.title("Histogram of Instantaneous Speed (Vr)")
+plt.xlabel("Speed (m/s)")
+plt.ylabel("Frequency")
+plt.legend()
+
+# 叠加平滑后的曲线
+peak_r, fwhm_r, smoothed_r = get_peak_and_fwhm_custom(counts_roll, bins_roll, n_iter=2)
+bin_centers_roll = 0.5 * (bins_roll[:-1] + bins_roll[1:])
+plt.plot(bin_centers_roll, smoothed_r, 'r-', label=f"Smoothed\nPeak={peak_r:.2e}\nFWHM={fwhm_r:.2e}")
+plt.legend()
+
+# (c) Savitzky-Golay 直方图
+plt.subplot(1, 3, 3)
+counts_sg, bins_sg = np.histogram(data['Vr_SG'], bins=bin_count, range=speed_range)
+plt.hist(bins_sg[:-1], bins=bins_sg, weights=counts_sg, alpha=0.7, color='C2', label='Savitzky-Golay')
+plt.title("Histogram of Instantaneous Speed (Vr)")
+plt.xlabel("Speed (m/s)")
+plt.ylabel("Frequency")
+plt.legend()
+
+# 叠加平滑后的曲线
+peak_sg, fwhm_sg, smoothed_sg = get_peak_and_fwhm_custom(counts_sg, bins_sg, n_iter=2)
+bin_centers_sg = 0.5 * (bins_sg[:-1] + bins_sg[1:])
+# 这里叠加曲线用另一种颜色, 例如 'C3'
+plt.plot(bin_centers_sg, smoothed_sg, color='C3',
+         label=f"Smoothed\nPeak={peak_sg:.2e}\nFWHM={fwhm_sg:.2e}")
+plt.legend()
+
+plt.tight_layout()
+plt.savefig("Histogram_Comparison.png", dpi=300)  # 保存图像 (三子图)
+plt.show()
+
+# ========== 构建 hist_data_m 用于后面找最高频 bin ==========
+hist_data_m = {
+    "Raw Vr": np.histogram(data['Vr'], bins=bin_count, range=speed_range),
+    "Rolling Avg": (counts_roll, bins_roll),
+    "Savitzky-Golay": (counts_sg, bins_sg)
+}
+
+# ========== 同时把 (Peak, FWHM) 也记录下来 ==========
+peak_fwhm_map = {
+    "Rolling Avg": (peak_r, fwhm_r),
+    "Savitzky-Golay": (peak_sg, fwhm_sg)
+    # 如果想对 Raw Vr 也做平滑并计算峰与 FWHM，则在此处添加相应操作
+}
+
+# ---------------- 计算最高频率的 bin + 整合半高全宽 ----------------
+bin_results_m = []
+for method, (counts, bins) in hist_data_m.items():
+    max_index = np.argmax(counts)  # 找到最高频率的 bin 索引
+    max_bin_center = (bins[max_index] + bins[max_index + 1]) / 2  # 计算 bin 中心值
+    max_frequency = counts[max_index]
+    
+    # 粘滞力(仅用于参考)
+    viscousF = 6 * np.pi * viscosity * radius * max_bin_center
+    
+    # 构建行字典
+    row_info = {
+        "Method": method,
+        "Max Bin Center (m/s)": max_bin_center,
+        "Max Frequency": max_frequency,
+        "viscous FORCE (pN)": viscousF * 1e12  # 换成 pN
+    }
+    # 如果在 peak_fwhm_map 里，就加上 Peak, FWHM
+    if method in peak_fwhm_map:
+        row_info["Peak (m/s)"] = peak_fwhm_map[method][0]
+        row_info["FWHM (m/s)"] = peak_fwhm_map[method][1]
+    else:
+        row_info["Peak (m/s)"] = np.nan
+        row_info["FWHM (m/s)"] = np.nan
+    
+    bin_results_m.append(row_info)
+
+df_bins_m = pd.DataFrame(bin_results_m)
+print("\nFinal Stats Table (incl. Peak & FWHM):")
+print(df_bins_m)
+
+# 将表格保存为 CSV
+output_path = "final_stats_incl_fwhm.csv"
+df_bins_m.to_csv(output_path, index=False)
+print(f"Saved table to '{output_path}'")
