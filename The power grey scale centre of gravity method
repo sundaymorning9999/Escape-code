@@ -1,0 +1,161 @@
+##### import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+import pandas as pd
+from IPython.display import display, clear_output
+from tqdm.notebook import tqdm  # ✅ 进度条
+
+# 启用 Matplotlib 交互模式
+%matplotlib widget  
+
+# 读取 MP4 视频
+video_path = "F POWER is 0.60.avi"
+output_video_path = video_path.replace(".avi", "_processed.avi")
+
+cap = cv2.VideoCapture(video_path)
+
+# 获取视频信息
+frame_width = int(cap.get(3))
+frame_height = int(cap.get(4))
+fps = int(cap.get(cv2.CAP_PROP_FPS))
+frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+# 初始化视频写入器
+fourcc = cv2.VideoWriter_fourcc(*'XVID')  
+out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+
+# 记录圆心数据
+circle_data = []
+
+# 读取第一帧以选择 ROI
+ret, first_frame = cap.read()
+cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 重置帧位置
+
+if not ret:
+    print("无法读取视频")
+    cap.release()
+else:
+    h_img, w_img, _ = first_frame.shape
+    x_init, y_init, w_init, h_init = 130, 50, 270, 270  # 初始 ROI
+
+    # **创建滑块**
+    x_slider = widgets.IntSlider(min=0, max=w_img-50, value=x_init, description="X 位置")
+    y_slider = widgets.IntSlider(min=0, max=h_img-50, value=y_init, description="Y 位置")
+    w_slider = widgets.IntSlider(min=20, max=w_img, value=w_init, description="宽度")
+    h_slider = widgets.IntSlider(min=20, max=h_img, value=h_init, description="高度")
+    confirm_button = widgets.Button(description="确认 ROI")
+
+    # **创建 Matplotlib 画布**
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.imshow(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
+    roi_rect = plt.Rectangle((x_init, y_init), w_init, h_init,
+                             linewidth=2, edgecolor='r', facecolor='none')
+    ax.add_patch(roi_rect)
+    ax.set_title("调整滑块选择 ROI")
+
+    def update_rect(*args):
+        """更新矩形框"""
+        roi_rect.set_xy((x_slider.value, y_slider.value))
+        roi_rect.set_width(w_slider.value)
+        roi_rect.set_height(h_slider.value)
+        fig.canvas.draw_idle()  # **强制刷新 Matplotlib**
+
+    # **监听滑块变化**
+    x_slider.observe(update_rect, names='value')
+    y_slider.observe(update_rect, names='value')
+    w_slider.observe(update_rect, names='value')
+    h_slider.observe(update_rect, names='value')
+
+    display(x_slider, y_slider, w_slider, h_slider, confirm_button)
+
+    def process_video(b):
+        """处理整个视频，并显示进度条"""
+        clear_output(wait=True)
+        display(x_slider, y_slider, w_slider, h_slider, confirm_button)
+
+        x, y, w, h = x_slider.value, y_slider.value, w_slider.value, h_slider.value
+        print(f"开始处理视频，每帧ROI: ({x}, {y}, {w}, {h})")
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 重置到第一帧
+        frame_idx = 0
+
+        # **添加进度条**
+        progress = tqdm(total=frame_count, desc="Processing Video", unit="frame")
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # **图像处理**
+            image_no_red = frame.copy()
+            image_no_red[:, :, 2] = 0  # 去掉红色通道
+            
+            green_scale = 0.7  # 例如减少 20%
+            blue_scale = 1   # 例如增加 20%
+
+            image_no_red[:, :, 1] = (image_no_red[:, :, 1] * green_scale).astype(np.uint8)
+            image_no_red[:, :, 0] = (image_no_red[:, :, 0] * blue_scale).astype(np.uint8)
+            gray = cv2.cvtColor(image_no_red, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=10.0, tileGridSize=(10, 50))
+            gray = clahe.apply(gray)
+            blurred = cv2.medianBlur(gray, 5)
+
+            result_frame = frame.copy()
+            min_contour_area = 10000  
+            max_contour_area = 30000  
+
+            # 处理 ROI
+            roi_img = blurred[y:y+h, x:x+w]
+
+            # Otsu 阈值
+            _, thresh = cv2.threshold(roi_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # 形态学修复
+            kernel = np.ones((3, 3), np.uint8)
+            thresh_fixed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+            # 轮廓检测
+            contours, _ = cv2.findContours(thresh_fixed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            filtered_contours = [cnt for cnt in contours if min_contour_area < cv2.contourArea(cnt) < max_contour_area]
+
+            if filtered_contours:
+                largest_contour = max(filtered_contours, key=cv2.contourArea)
+                (cx, cy), radius = cv2.minEnclosingCircle(largest_contour)
+
+                # 转换坐标到全图
+                cx, cy = int(cx + x), int(cy + y)
+
+                # 画拟合圆
+                cv2.circle(result_frame, (cx, cy), int(radius), (0, 255, 0), 2)
+                cv2.circle(result_frame, (cx, cy), 2, (0, 0, 255), 3)
+
+                # 记录圆心数据
+                circle_data.append([frame_idx, cx, cy, int(radius)])
+
+            # 写入新视频
+            out.write(result_frame)
+
+            # 更新进度条
+            progress.update(1)
+            frame_idx += 1
+
+        # 关闭进度条
+        progress.close()
+
+        # 释放资源
+        cap.release()
+        out.release()
+
+        # **保存数据为 CSV**
+        df = pd.DataFrame(circle_data, columns=["Frame", "X", "Y", "Radius"])
+        csv_path = video_path.replace(".avi", "_circle_data.csv")
+        df.to_csv(csv_path, index=False)
+
+        print(f"\n✅ 视频处理完成！")
+        print(f"📂 处理后的视频: {output_video_path}")
+        print(f"📊 轨迹数据 CSV: {csv_path}")
+
+    confirm_button.on_click(process_video)
+
